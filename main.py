@@ -8,8 +8,76 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from typing import TypedDict, Callable, Optional
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-DEFAULT_REPO = os.environ.get("GITHUB_REPO", "chiharumakino7-create/ai-dev-orchestrator")
+def get_github_token():
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        return token
+
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        return result.stdout.strip() or None
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+
+def get_writable_github_repositories():
+    token = get_github_token()
+    if not token:
+        raise RuntimeError(
+            "GitHub認証が見つかりません。Codespacesの `gh` 認証、"
+            "`GITHUB_TOKEN`、または `GH_TOKEN` を設定してください。"
+        )
+
+    repositories = []
+    page = 1
+    while True:
+        try:
+            response = requests.get(
+                "https://api.github.com/user/repos",
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                params={
+                    "affiliation": "owner,collaborator,organization_member",
+                    "visibility": "all",
+                    "per_page": 100,
+                    "page": page,
+                },
+                timeout=15,
+            )
+            response.raise_for_status()
+        except requests.RequestException as error:
+            raise RuntimeError(f"GitHubリポジトリ一覧を取得できませんでした: {error}") from error
+
+        page_repositories = response.json()
+        if not isinstance(page_repositories, list):
+            raise RuntimeError("GitHubから予期しないリポジトリ一覧が返されました。")
+        repositories.extend(
+            {
+                "full_name": repository["full_name"],
+                "default_branch": repository["default_branch"],
+            }
+            for repository in page_repositories
+            if repository.get("permissions", {}).get("push")
+            and repository.get("full_name")
+            and repository.get("default_branch")
+        )
+        if len(page_repositories) < 100:
+            return repositories
+        page += 1
+
+def get_writable_github_repository(full_name: str):
+    for repository in get_writable_github_repositories():
+        if repository["full_name"] == full_name:
+            return repository
+    raise ValueError("選択したリポジトリに書き込み権限がありません。")
 
 class CancellationError(Exception):
     pass
@@ -143,6 +211,7 @@ class DevState(TypedDict):
     plan_model: str
     code_model: str
     github_repo: str
+    github_branch: str
     spec: str
     code: str
     test_result: str
@@ -237,20 +306,22 @@ def commit_node(state: DevState):
         CURRENT_STATUS_CB("🚀 **【Git同期 (Commit & Push)】** GitHubリポジトリへコミット＆プッシュを実行中...")
 
     target_file = state.get("target_file", "generated_app.py")
-    repo = state.get("github_repo") or DEFAULT_REPO
-    if not GITHUB_TOKEN or not repo:
+    repo = state.get("github_repo")
+    branch = state.get("github_branch") or "main"
+    token = get_github_token()
+    if not token or not repo:
         return {"is_success": False, "test_result": "GitHub Token or Repo is missing"}
 
     try:
         subprocess.run(["git", "config", "--global", "user.name", "ai-orchestrator"], check=True)
         subprocess.run(["git", "config", "--global", "user.email", "orchestrator@agent.local"], check=True)
-        remote_url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{repo}.git"
+        remote_url = f"https://x-access-token:{token}@github.com/{repo}.git"
         subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=True)
         subprocess.run(["git", "add", target_file], check=True)
         commit_msg = f"feat/fix: auto update {target_file} by ai-orchestrator"
         subprocess.run(["git", "commit", "-m", commit_msg], check=True)
-        subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False)
-        subprocess.run(["git", "push", "origin", "main"], check=True)
+        subprocess.run(["git", "pull", "--rebase", "origin", branch], check=False)
+        subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], check=True)
         print("🎉 GitHubへの自動プッシュ完了！")
     except subprocess.CalledProcessError as e:
         print("⚠️ Git操作でエラー:", e)

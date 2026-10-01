@@ -10,14 +10,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
-from main import dev_workflow, set_runtime_callbacks
+from main import (
+    dev_workflow,
+    get_writable_github_repositories,
+    get_writable_github_repository,
+    set_runtime_callbacks,
+)
 
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
-DEFAULT_REPO = os.environ.get(
-    "GITHUB_REPO", "chiharumakino7-create/ai-dev-orchestrator"
-)
 MAX_REQUEST_SIZE = 1024 * 1024
 MODEL_SUGGESTIONS = [
     "gemini/gemini-3.8-flash",
@@ -121,6 +123,7 @@ def validate_target_file(target_file):
 
 def start_workflow(form):
     target_file = validate_target_file(form.get("target_file", "").strip())
+    repository = get_writable_github_repository(form.get("github_repo", "").strip())
     request_text = form.get("request", "").strip()
     if not request_text:
         request_text = form.get("uploaded_spec", "").strip()
@@ -138,7 +141,8 @@ def start_workflow(form):
         STATE["error"] = ""
         STATE["form"] = {
             "target_file": target_file,
-            "github_repo": form.get("github_repo", DEFAULT_REPO).strip(),
+            "github_repo": repository["full_name"],
+            "github_branch": repository["default_branch"],
             "plan_model": form.get("plan_model", MODEL_SUGGESTIONS[0]).strip(),
             "code_model": form.get("code_model", MODEL_SUGGESTIONS[0]).strip(),
             "request": request_text,
@@ -173,6 +177,7 @@ def run_workflow(form, saved_spec):
                 "plan_model": form["plan_model"],
                 "code_model": form["code_model"],
                 "github_repo": form["github_repo"],
+                "github_branch": form["github_branch"],
                 "spec": saved_spec,
                 "code": "",
                 "test_result": "",
@@ -242,12 +247,15 @@ def render_page(error=""):
 </head>
 <body>
   <h1>🤖 AI開発自律オーケストレーター</h1>
-  <p class="hint">この画面はPython標準ライブラリのHTTPサーバーで動作します。外部API連携用の追加サービスは不要です。</p>
+  <p class="hint">この画面はPython標準ライブラリのHTTPサーバーで動作します。GitHubにログイン済みのアカウントから書き込み可能なリポジトリを取得します。</p>
   {error_html}
   <form method="post" action="/run" enctype="multipart/form-data">
     <label>対象GitHubリポジトリ
-      <input name="github_repo" value="{html.escape(form.get("github_repo", DEFAULT_REPO), quote=True)}" required>
+      <select id="github-repo" name="github_repo" data-selected="{html.escape(form.get("github_repo", ""), quote=True)}" required>
+        <option value="">リポジトリ一覧を読み込み中...</option>
+      </select>
     </label>
+    <p id="repo-error" class="error"></p>
     <label>対象ファイル (.py)
       <input name="target_file" list="target-files" value="{html.escape(form.get("target_file", "new_tool.py"), quote=True)}" required>
       <datalist id="target-files">{target_options}</datalist>
@@ -286,6 +294,24 @@ def render_page(error=""):
     <h3>エラー詳細</h3><pre id="result-error"></pre>
   </section>
   <script>
+    async function loadRepositories() {{
+      const select = document.getElementById('github-repo');
+      const error = document.getElementById('repo-error');
+      try {{
+        const response = await fetch('/repos', {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'リポジトリ一覧を取得できませんでした。');
+        select.replaceChildren(new Option('リポジトリを選択してください', ''));
+        for (const repo of data.repositories) {{
+          select.add(new Option(repo.full_name + ' (' + repo.default_branch + ')', repo.full_name));
+        }}
+        select.value = select.dataset.selected;
+        if (!data.repositories.length) error.textContent = '書き込み可能なリポジトリがありません。';
+      }} catch (exception) {{
+        select.replaceChildren(new Option('リポジトリ一覧を取得できません', ''));
+        error.textContent = exception.message;
+      }}
+    }}
     async function updateStatus() {{
       try {{
         const response = await fetch('/status', {{ cache: 'no-store' }});
@@ -313,6 +339,7 @@ def render_page(error=""):
       await fetch('/cancel', {{ method: 'POST' }});
       updateStatus();
     }}
+    loadRepositories();
     updateStatus();
     setInterval(updateStatus, 1500);
   </script>
@@ -322,7 +349,21 @@ def render_page(error=""):
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/status":
+        if self.path == "/repos":
+            try:
+                payload = {"repositories": get_writable_github_repositories()}
+                status = 200
+            except RuntimeError as error:
+                payload = {"repositories": [], "error": str(error)}
+                status = 503
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/status":
             with STATE_LOCK:
                 payload = {
                     "running": STATE["running"],
@@ -358,7 +399,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             form = parse_form(self)
             start_workflow(form)
-        except (UnicodeDecodeError, ValueError) as error:
+        except (UnicodeDecodeError, RuntimeError, ValueError) as error:
             self.send_html(render_page(str(error)), status=400)
             return
         self.send_response(303)
