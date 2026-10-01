@@ -1,306 +1,383 @@
+import ast
+import html
+import json
 import os
-import glob
+import re
+import threading
+from email.parser import BytesParser
+from email.policy import default
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs
 
-import sys
+from main import dev_workflow, set_runtime_callbacks
 
-# Python標準ライブラリ名のリスト（除外用）
-STDLIB_MODULES = set(sys.builtin_module_names) | {
-    "os", "sys", "time", "re", "math", "json", "glob", "shutil", "pathlib",
-    "datetime", "subprocess", "random", "collections", "itertools", "functools",
-    "typing", "typing_extensions", "unittest", "logging", "hashlib", "io",
-    "tempfile", "traceback", "copy", "threading", "multiprocessing", "queue",
-    "socket", "http", "urllib", "email", "csv", "sqlite3", "base64", "uuid"
-}
 
-# パッケージ名とインポート名が異なるもののマッピング
-PACKAGE_MAPPING = {
-    "cv2": "opencv-python-headless",
-    "PIL": "pillow",
-    "yaml": "pyyaml",
-    "bs4": "beautifulsoup4",
-    "sklearn": "scikit-learn"
-}
-
-def extract_pip_packages(code: str) -> list[str]:
-    import ast
-    packages = set()
-    try:
-        tree = ast.parse(code)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    pkg = alias.name.split(".")[0]
-                    if pkg and pkg not in STDLIB_MODULES:
-                        packages.add(PACKAGE_MAPPING.get(pkg, pkg))
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    pkg = node.module.split(".")[0]
-                    if pkg and pkg not in STDLIB_MODULES:
-                        packages.add(PACKAGE_MAPPING.get(pkg, pkg))
-    except Exception:
-        pass
-    return sorted(list(packages))
-
-import streamlit as st
-from main import app as dev_workflow, get_available_gemini_models, set_runtime_callbacks
-
-st.set_page_config(page_title="AI Dev Orchestrator", page_icon="🤖", layout="wide")
-st.title("🤖 AI開発自律オーケストレーター")
-
-# カスタムスタイル
-st.markdown("""
-<style>
-button[kind="primary"] {
-    background-color: #10b981 !important;
-    border-color: #10b981 !important;
-    color: #ffffff !important;
-    font-weight: 600 !important;
-}
-button[kind="primary"]:hover {
-    background-color: #059669 !important;
-    border-color: #059669 !important;
-}
-button[kind="secondary"] {
-    border-color: #ef4444 !important;
-    color: #ef4444 !important;
-}
-button[kind="secondary"]:hover {
-    background-color: #fef2f2 !important;
-    border-color: #dc2626 !important;
-    color: #dc2626 !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# セッション状態管理
-if "saved_spec" not in st.session_state:
-    st.session_state.saved_spec = ""
-if "cancel_requested" not in st.session_state:
-    st.session_state.cancel_requested = False
-if "last_request_text" not in st.session_state:
-    st.session_state.last_request_text = ""
-
-# --- サイドバー設定パネル ---
-st.sidebar.header("⚙️ パイプライン設定")
-
-default_repo = os.environ.get("GITHUB_REPO", "chiharumakino7-create/ai-dev-orchestrator")
-repo_input = st.sidebar.text_input("📁 対象GitHubリポジトリ", value=default_repo)
-
-real_gemini_models = get_available_gemini_models()
-other_models = [
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "8000"))
+DEFAULT_REPO = os.environ.get(
+    "GITHUB_REPO", "chiharumakino7-create/ai-dev-orchestrator"
+)
+MAX_REQUEST_SIZE = 1024 * 1024
+MODEL_SUGGESTIONS = [
+    "gemini/gemini-3.8-flash",
     "gpt-4o",
     "gpt-4o-mini",
     "o3-mini",
     "anthropic/claude-3-5-sonnet-20241022",
     "groq/llama-3.3-70b-versatile",
-    "✏️ 手動でモデル名を入力..."
 ]
-available_options = real_gemini_models + other_models
+STDLIB_MODULES = set(__import__("sys").builtin_module_names) | {
+    "os", "sys", "time", "re", "math", "json", "glob", "shutil", "pathlib",
+    "datetime", "subprocess", "random", "collections", "itertools", "functools",
+    "typing", "typing_extensions", "unittest", "logging", "hashlib", "io",
+    "tempfile", "traceback", "copy", "threading", "multiprocessing", "queue",
+    "socket", "http", "urllib", "email", "csv", "sqlite3", "base64", "uuid",
+}
+PACKAGE_MAPPING = {
+    "cv2": "opencv-python-headless",
+    "PIL": "pillow",
+    "yaml": "pyyaml",
+    "bs4": "beautifulsoup4",
+    "sklearn": "scikit-learn",
+}
 
-st.sidebar.subheader("🧠 モデル選択")
+STATE_LOCK = threading.Lock()
+CANCEL_EVENT = threading.Event()
+STATE = {
+    "running": False,
+    "logs": [],
+    "spec": "",
+    "result": None,
+    "error": "",
+    "form": {},
+    "last_request_text": "",
+}
 
-plan_choice = st.sidebar.selectbox("📋 要件分析・仕様策定 (Plan)", available_options, index=0)
-plan_model = st.sidebar.text_input("Planモデル名 (LiteLLM形式)", value="gemini/gemini-3.8-flash") if plan_choice == "✏️ 手動でモデル名を入力..." else plan_choice
 
-code_choice = st.sidebar.selectbox("💻 コード生成・修正 (Code)", available_options, index=0)
-code_model = st.sidebar.text_input("Codeモデル名 (LiteLLM形式)", value="gemini/gemini-3.8-flash") if code_choice == "✏️ 手動でモデル名を入力..." else code_choice
-
-st.sidebar.markdown("---")
-st.sidebar.caption("💡 実行中の詳細ステータスはライブウィンドウでリアルタイム監視できます。")
-
-# --- メイン画面：対象ファイル選択 ---
-st.subheader("🎯 開発対象ファイルの選択")
-
-py_files = sorted([f for f in glob.glob("*.py") if f not in ["app.py", "main.py"]])
-file_options = ["➕ 新規ファイルを作成..."] + py_files
-selected_option = st.selectbox("対象ファイルを選択", file_options, index=0)
-
-if selected_option == "➕ 新規ファイルを作成...":
-    target_file = st.text_input("新規作成するファイル名 (.py)", value="new_tool.py")
-    is_existing = False
-else:
-    target_file = selected_option
-    is_existing = os.path.exists(target_file)
-
-existing_code = ""
-if is_existing:
-    st.info(f"ℹ️ **【修正・改善パイプライン】** 既存ファイル `{target_file}` を読み込み、要件に合わせてリファクタリングします。")
-    with open(target_file, "r", encoding="utf-8") as f:
-        existing_code = f.read()
-    with st.expander(f"📄 現在の `{target_file}` のコードを確認", expanded=False):
-        st.code(existing_code, language="python")
-else:
-    st.warning(f"🆕 **【新規作成パイプライン】** `{target_file}` を新しくゼロから生成します。")
-
-# --- 要件入力 ---
-st.subheader("📝 要件・仕様の入力")
-
-uploaded_file = st.file_uploader("📎 要件定義・仕様書ファイル (.md / .txt) がある場合はアップロード", type=["md", "txt"])
-
-initial_text = ""
-if uploaded_file is not None:
+def extract_pip_packages(code):
+    packages = set()
     try:
-        initial_text = uploaded_file.read().decode("utf-8")
-        st.success(f"✅ `{uploaded_file.name}` の内容を読み込みました！")
-    except Exception as e:
-        st.error(f"読み込み失敗: {e}")
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names = [node.module]
+        else:
+            continue
+        for name in names:
+            package = name.split(".")[0]
+            if package and package not in STDLIB_MODULES:
+                packages.add(PACKAGE_MAPPING.get(package, package))
+    return sorted(packages)
 
-instruction_label = "要件・指示・エラーログ" if not is_existing else "改修要件・追加したい機能・エラーログ"
-user_request = st.text_area(instruction_label, value=initial_text, height=160, placeholder="ここに要望を入力してください。")
 
-# 新しい指示が入力された場合、古い仕様を自動リセットして再策定させる
-if user_request.strip() and user_request.strip() != st.session_state.last_request_text:
-    if st.session_state.saved_spec:
-        st.session_state.saved_spec = ""
-    st.session_state.last_request_text = user_request.strip()
+def parse_form(handler):
+    content_type = handler.headers.get("Content-Type", "")
+    length = int(handler.headers.get("Content-Length", "0"))
+    if length < 0 or length > MAX_REQUEST_SIZE:
+        raise ValueError("送信サイズは1MB以下にしてください。")
+    body = handler.rfile.read(length)
+    if content_type.lower().startswith("multipart/form-data"):
+        envelope = (
+            f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode()
+            + body
+        )
+        message = BytesParser(policy=default).parsebytes(envelope)
+        fields = {}
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if not name:
+                continue
+            value = part.get_payload(decode=True) or b""
+            if part.get_filename():
+                if name == "spec_file" and value:
+                    fields["uploaded_spec"] = value.decode("utf-8")
+            else:
+                charset = part.get_content_charset() or "utf-8"
+                fields[name] = value.decode(charset)
+        return fields
+
+    parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    return {key: values[-1] for key, values in parsed.items()}
 
 
-# --- 保存済み仕様書の表示＆手直し枠 ---
-if st.session_state.saved_spec:
-    st.success("💾 **仕様策定（Plan）は完了・保持されています！** （手動編集も可能です）")
-    with st.expander("📋 策定済み仕様書を確認・手動編集", expanded=True):
-        st.session_state.saved_spec = st.text_area("仕様書内容", value=st.session_state.saved_spec, height=180)
-        if st.button("🗑️ 仕様をクリアして最初から作り直す"):
-            st.session_state.saved_spec = ""
-            st.rerun()
+def validate_target_file(target_file):
+    if (
+        not target_file
+        or target_file in {".", ".."}
+        or "/" in target_file
+        or "\\" in target_file
+        or Path(target_file).name != target_file
+        or not target_file.endswith(".py")
+        or target_file in {"app.py", "main.py"}
+    ):
+        raise ValueError("対象ファイルには app.py / main.py 以外の .py ファイル名を指定してください。")
+    return target_file
 
-# --- 実行ボタンエリア ---
-col_run, col_cancel = st.columns([2, 1])
 
-with col_cancel:
-    if st.button("🛑 処理をキャンセル", type="secondary", use_container_width=True):
-        st.session_state.cancel_requested = True
-        st.warning("⚠️ キャンセル要求を送信しました...")
+def start_workflow(form):
+    target_file = validate_target_file(form.get("target_file", "").strip())
+    request_text = form.get("request", "").strip()
+    if not request_text:
+        request_text = form.get("uploaded_spec", "").strip()
+    with STATE_LOCK:
+        if STATE["running"]:
+            raise ValueError("別のパイプラインが実行中です。")
+        saved_spec = form.get("spec", "").strip()
+        if request_text != STATE["last_request_text"]:
+            saved_spec = ""
+        STATE["last_request_text"] = request_text
+        STATE["running"] = True
+        STATE["logs"] = []
+        STATE["spec"] = saved_spec
+        STATE["result"] = None
+        STATE["error"] = ""
+        STATE["form"] = {
+            "target_file": target_file,
+            "github_repo": form.get("github_repo", DEFAULT_REPO).strip(),
+            "plan_model": form.get("plan_model", MODEL_SUGGESTIONS[0]).strip(),
+            "code_model": form.get("code_model", MODEL_SUGGESTIONS[0]).strip(),
+            "request": request_text,
+        }
+        worker_form = STATE["form"].copy()
+        CANCEL_EVENT.clear()
 
-button_label = "🚀 コード生成から再開・実行" if st.session_state.saved_spec else "🚀 開発パイプラインを実行"
+    worker = threading.Thread(
+        target=run_workflow,
+        args=(worker_form, saved_spec),
+        daemon=True,
+    )
+    worker.start()
 
-with col_run:
-    run_btn = st.button(button_label, type="primary", use_container_width=True)
 
-if run_btn:
-    if not user_request.strip() and not st.session_state.saved_spec:
-        st.error("要件または指示を入力してください！")
-    elif not target_file.endswith(".py"):
-        st.error("ファイル名は .py で終わる必要があります！")
-    else:
-        st.session_state.cancel_requested = False
+def run_workflow(form, saved_spec):
+    def log_status(message):
+        with STATE_LOCK:
+            STATE["logs"].append(str(message))
 
-        with st.status("🚀 パイプラインを起動しています...", expanded=True) as status_window:
-            execution_logs = []
-            
-            def log_status(msg: str):
-                execution_logs.append(msg)
-                status_window.write(msg)
-                if "【仕様策定" in msg:
-                    status_window.update(label="📋 仕様策定フェーズを実行中...", state="running")
-                elif "【コード生成" in msg:
-                    status_window.update(label="💻 コード生成フェーズを実行中...", state="running")
-                elif "【構文テスト" in msg:
-                    status_window.update(label="🧪 構文テストを実行中...", state="running")
-                elif "【Git同期" in msg:
-                    status_window.update(label="🚀 GitHub同期を実行中...", state="running")
-
-            def check_cancellation():
-                return st.session_state.get("cancel_requested", False)
-
-            # コールバックを実行時コンテキストに登録（Stateには渡さない）
-            set_runtime_callbacks(status_cb=log_status, cancel_fn=check_cancellation)
-
-            thread_config = {
-                "configurable": {"thread_id": f"dev_{target_file}"},
-                "recursion_limit": 15
+    set_runtime_callbacks(status_cb=log_status, cancel_fn=CANCEL_EVENT.is_set)
+    try:
+        existing_code = ""
+        target_path = Path(form["target_file"])
+        if target_path.is_file():
+            existing_code = target_path.read_text(encoding="utf-8")
+        result = dev_workflow.invoke(
+            {
+                "request": form["request"],
+                "target_file": form["target_file"],
+                "existing_code": existing_code,
+                "plan_model": form["plan_model"],
+                "code_model": form["code_model"],
+                "github_repo": form["github_repo"],
+                "spec": saved_spec,
+                "code": "",
+                "test_result": "",
+                "iteration": 0,
+                "is_success": False,
+            },
+            config={
+                "configurable": {"thread_id": f"dev_{form['target_file']}"},
+                "recursion_limit": 15,
+            },
+        )
+        with STATE_LOCK:
+            STATE["result"] = {
+                "is_success": bool(result.get("is_success")),
+                "spec": result.get("spec", ""),
+                "code": result.get("code", ""),
+                "test_result": result.get("test_result", ""),
+                "packages": extract_pip_packages(result.get("code", "")),
             }
+            if result.get("spec"):
+                STATE["spec"] = result["spec"]
+    except Exception as error:
+        with STATE_LOCK:
+            STATE["error"] = str(error)
+    finally:
+        set_runtime_callbacks(None, None)
+        with STATE_LOCK:
+            STATE["running"] = False
 
-            try:
-                # 純粋なプリミティブ型のみをinvokeに渡す
-                result = dev_workflow.invoke({
-                    "request": user_request,
-                    "target_file": target_file,
-                    "existing_code": existing_code,
-                    "plan_model": plan_model,
-                    "code_model": code_model,
-                    "github_repo": repo_input,
-                    "spec": st.session_state.saved_spec,
-                    "code": "",
-                    "test_result": "",
-                    "iteration": 0,
-                    "is_success": False
-                }, config=thread_config)
 
-                if result.get("spec"):
-                    st.session_state.saved_spec = result.get("spec")
+def render_page(error=""):
+    with STATE_LOCK:
+        form = STATE["form"].copy()
+        spec = STATE["spec"]
+        running = STATE["running"]
+    target_files = sorted(
+        path.name
+        for path in Path(".").glob("*.py")
+        if path.name not in {"app.py", "main.py"}
+    )
+    options = "".join(
+        f'<option value="{html.escape(name, quote=True)}"></option>'
+        for name in MODEL_SUGGESTIONS
+    )
+    target_options = "".join(
+        f'<option value="{html.escape(name, quote=True)}"></option>'
+        for name in target_files
+    )
+    error_html = (
+        f'<p class="error">{html.escape(error)}</p>' if error else ""
+    )
+    return f"""<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI開発自律オーケストレーター</title>
+  <style>
+    body {{ font: 16px system-ui, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; color: #1f2937; }}
+    h1 {{ color: #065f46; }} label {{ display: block; font-weight: 600; margin-top: 1rem; }}
+    input, textarea {{ box-sizing: border-box; width: 100%; padding: .65rem; margin-top: .35rem; border: 1px solid #9ca3af; border-radius: 5px; }}
+    textarea {{ min-height: 130px; }} button {{ padding: .7rem 1.1rem; border: 0; border-radius: 5px; cursor: pointer; }}
+    .run {{ background: #10b981; color: white; font-weight: 700; }} .cancel {{ background: #fff; color: #dc2626; border: 1px solid #dc2626; }}
+    .actions {{ display: flex; gap: .75rem; margin-top: 1.25rem; }} .panel {{ margin-top: 1.5rem; padding: 1rem; background: #f3f4f6; border-radius: 6px; }}
+    pre {{ white-space: pre-wrap; overflow-wrap: anywhere; }} .error {{ color: #b91c1c; }} .hint {{ color: #4b5563; font-size: .9rem; }}
+  </style>
+</head>
+<body>
+  <h1>🤖 AI開発自律オーケストレーター</h1>
+  <p class="hint">この画面はPython標準ライブラリのHTTPサーバーで動作します。外部API連携用の追加サービスは不要です。</p>
+  {error_html}
+  <form method="post" action="/run" enctype="multipart/form-data">
+    <label>対象GitHubリポジトリ
+      <input name="github_repo" value="{html.escape(form.get("github_repo", DEFAULT_REPO), quote=True)}" required>
+    </label>
+    <label>対象ファイル (.py)
+      <input name="target_file" list="target-files" value="{html.escape(form.get("target_file", "new_tool.py"), quote=True)}" required>
+      <datalist id="target-files">{target_options}</datalist>
+    </label>
+    <label>Planモデル名
+      <input name="plan_model" list="models" value="{html.escape(form.get("plan_model", MODEL_SUGGESTIONS[0]), quote=True)}" required>
+    </label>
+    <label>Codeモデル名
+      <input name="code_model" list="models" value="{html.escape(form.get("code_model", MODEL_SUGGESTIONS[0]), quote=True)}" required>
+      <datalist id="models">{options}</datalist>
+    </label>
+    <label>要件・指示・エラーログ
+      <textarea name="request" placeholder="作成・修正したい内容を入力してください">{html.escape(form.get("request", ""))}</textarea>
+    </label>
+    <label>要件定義ファイル (.md / .txt)
+      <input type="file" name="spec_file" accept=".md,.txt,text/plain">
+    </label>
+    <label>保存済み仕様書（編集可能）
+      <textarea id="spec" name="spec">{html.escape(spec)}</textarea>
+    </label>
+    <div class="actions">
+      <button id="run" class="run" type="submit">🚀 開発パイプラインを実行</button>
+      <button id="cancel" class="cancel" type="button" onclick="cancelRun()">🛑 処理をキャンセル</button>
+    </div>
+  </form>
+  <section class="panel">
+    <h2 id="status">待機中</h2>
+    <pre id="logs">実行ログはここに表示されます。</pre>
+  </section>
+  <section class="panel" id="result" hidden>
+    <h2>実行結果</h2>
+    <p id="result-message"></p>
+    <p id="packages"></p>
+    <h3>仕様</h3><pre id="result-spec"></pre>
+    <h3>コード</h3><pre id="result-code"></pre>
+    <h3>エラー詳細</h3><pre id="result-error"></pre>
+  </section>
+  <script>
+    async function updateStatus() {{
+      try {{
+        const response = await fetch('/status', {{ cache: 'no-store' }});
+        const data = await response.json();
+        document.getElementById('status').textContent = data.running ? '実行中' : (data.result ? (data.result.is_success ? '完了' : '終了') : '待機中');
+        document.getElementById('logs').textContent = data.logs.join('\\n') || '実行ログはここに表示されます。';
+        document.getElementById('run').disabled = data.running;
+        document.getElementById('cancel').disabled = !data.running;
+        const spec = document.getElementById('spec');
+        if (document.activeElement !== spec && data.spec) spec.value = data.spec;
+        if (data.result || data.error) {{
+          const panel = document.getElementById('result');
+          panel.hidden = false;
+          document.getElementById('result-message').textContent = data.error || (data.result.is_success ? 'パイプラインが正常に完了しました。' : 'パイプラインが失敗しました。');
+          document.getElementById('result-spec').textContent = data.result ? data.result.spec : '';
+          document.getElementById('result-code').textContent = data.result ? data.result.code : '';
+          document.getElementById('result-error').textContent = data.result ? data.result.test_result : '';
+          document.getElementById('packages').textContent = data.result && data.result.packages.length ? '必要パッケージ: pip install ' + data.result.packages.join(' ') : '';
+        }}
+      }} catch (error) {{
+        document.getElementById('status').textContent = '状態の取得に失敗しました: ' + error;
+      }}
+    }}
+    async function cancelRun() {{
+      await fetch('/cancel', {{ method: 'POST' }});
+      updateStatus();
+    }}
+    updateStatus();
+    setInterval(updateStatus, 1500);
+  </script>
+</body>
+</html>"""
 
-                err_msg = result.get("test_result", "")
 
-                err_msg = result.get("test_result", "")
-                if err_msg and not result.get("is_success"):
-                    execution_logs.append(f"❌ エラー内容: {err_msg}")
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/status":
+            with STATE_LOCK:
+                payload = {
+                    "running": STATE["running"],
+                    "logs": STATE["logs"][:],
+                    "spec": STATE["spec"],
+                    "result": STATE["result"],
+                    "error": STATE["error"],
+                }
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/":
+            self.send_html(render_page())
+        else:
+            self.send_error(404)
 
-                # 実行ログ全体（エラー詳細含む）をコピーできる枠を生成
-                if execution_logs:
-                    status_window.caption("📋 実行ログ・エラー詳細（右上アイコンからワンクリックで全体コピー可能）:")
-                    status_window.code("\n".join(execution_logs), language="text")
+    def do_POST(self):
+        if self.path == "/cancel":
+            with STATE_LOCK:
+                if STATE["running"]:
+                    CANCEL_EVENT.set()
+                    STATE["logs"].append("🛑 キャンセル要求を送信しました。")
+            self.send_response(204)
+            self.end_headers()
+            return
+        if self.path != "/run":
+            self.send_error(404)
+            return
+        try:
+            form = parse_form(self)
+            start_workflow(form)
+        except (UnicodeDecodeError, ValueError) as error:
+            self.send_html(render_page(str(error)), status=400)
+            return
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
 
-                if result.get("is_success"):
-                    status_window.update(label="🎉 すべての開発工程が正常に完了しました！", state="complete", expanded=False)
-                    st.success(f"🎉 `{target_file}` の自律生成・テスト・コミットが完了しました！")
-                    
-                    code_content = result.get("code", "")
-                    needed_pkgs = extract_pip_packages(code_content)
-                    
-                    st.markdown("### 🚀 すぐに動かすためのコマンド")
-                    if needed_pkgs:
-                        pip_cmd = f"pip install " + " ".join(needed_pkgs)
-                        st.caption("📦 必要な外部パッケージのインストール：")
-                        st.code(pip_cmd, language="bash")
-                    else:
-                        st.caption("📦 外部パッケージのインストールは不要です（標準ライブラリのみ）。")
-                    
-                    st.caption("▶️ アプリ・スクリプトの実行：")
-                    st.code(f"python3 {target_file}", language="bash")
+    def send_html(self, content, status=200):
+        body = content.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-                    st.subheader("📋 策定された仕様")
-                    st.markdown(result.get("spec"))
-                    st.subheader("💻 反映されたコード")
-                    st.code(code_content, language="python")
-                elif "キャンセル" in err_msg:
-                    status_window.update(label="🛑 処理が中断されました", state="error", expanded=True)
-                    st.warning(f"🛑 {err_msg}")
-                elif err_msg.startswith("【"):
-                    status_window.update(label="⚠️ エラーにより一時中断しました", state="error", expanded=True)
-                    st.warning(f"{err_msg}\n\n💡 **仕様（Plan）は保存されています。サイドバーで別のモデルを選択し、「再開」ボタンを押せば続きからコード生成を再開できます。**")
-                else:
-                    status_window.update(label="❌ パイプラインが失敗しました", state="error", expanded=True)
-                    st.error("❌ パイプラインが失敗しました。")
-                    
-                    # 1. 生のエラーログ
-                    st.code(err_msg, language="bash")
-                    
-                    # 2. そのままAIへ指示できる整形済みプロンプトの作成
-                    debug_prompt = f"""以下のファイルでエラーが発生しました。修正してください。
-【対象ファイル】: {target_file}
-【発生エラー】:
-{err_msg}
+    def log_message(self, format_string, *args):
+        print(f"{self.address_string()} - {format_string % args}")
 
-【改修要件】:
-上記エラーの原因を特定し、安全に動作するようにコードを修正してください。"""
-                    
-                    st.markdown("### 🛠️ デバッグ支援・ショートカット")
-                    
-                    # コピーしやすいコードブロック
-                    st.caption("📋 下の枠内（右上アイコン）からワンクリックでAIへの修正指示プロンプトをコピーできます：")
-                    st.code(debug_prompt, language="markdown")
-                    
-                    # ターミナル検証用コマンド
-                    st.caption("💻 ターミナルで手動検証するコマンド：")
-                    test_cmd = f"python3 -m py_compile {target_file} && python3 {target_file}"
-                    st.code(test_cmd, language="bash")
 
-            except Exception as e:
-                execution_logs.append(f"❌ 予期しない例外: {e}")
-                status_window.caption("📋 実行ログ・エラー詳細（右上アイコンからワンクリックで全体コピー可能）:")
-                status_window.code("\n".join(execution_logs), language="text")
-                status_window.update(label="❌ 予期しないエラーが発生しました", state="error", expanded=True)
-                st.error(f"❌ 実行エラー: {e}")
-            finally:
-                set_runtime_callbacks(None, None)
+if __name__ == "__main__":
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"AI Dev Orchestrator listening on http://{HOST}:{PORT}")
+    server.serve_forever()
