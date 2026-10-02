@@ -1,36 +1,63 @@
+import base64
 import os
 import re
 import time
 import subprocess
+import tempfile
+from pathlib import Path
 import requests
 import litellm
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from typing import TypedDict, Callable, Optional
+from credentials import delete_credential, get_credential, save_credential
+
+
+COPILOT_CLIENT_ID = os.environ.get(
+    "GITHUB_COPILOT_CLIENT_ID", "Iv1.b507a08c87ecfe98"
+)
 
 def get_github_token():
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if token:
-        return token
+    credential = get_credential("github")
+    return credential["value"] if credential else None
 
+def get_gemini_api_key():
+    credential = get_credential("gemini")
+    return credential["value"] if credential else None
+
+def get_copilot_token():
+    credential = get_credential("copilot")
+    return credential["value"] if credential else None
+
+def validate_gemini_api_key(api_key: str):
     try:
-        result = subprocess.run(
-            ["gh", "auth", "token"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
+        response = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": api_key},
+            timeout=15,
         )
-        return result.stdout.strip() or None
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as error:
+        status = getattr(error.response, "status_code", None)
+        detail = f" (HTTP {status})" if status else ""
+        raise ValueError(f"Gemini APIキーを確認できませんでした{detail}。") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+        raise ValueError("Gemini APIからモデル一覧を取得できませんでした。")
+    return True
+
+def save_gemini_api_key(api_key: str):
+    validate_gemini_api_key(api_key)
+    save_credential("gemini", api_key)
+
+def github_oauth_client_id():
+    return os.environ.get("GITHUB_OAUTH_CLIENT_ID", "").strip()
 
 def get_writable_github_repositories():
     token = get_github_token()
     if not token:
         raise RuntimeError(
-            "GitHub認証が見つかりません。Codespacesの `gh` 認証、"
-            "`GITHUB_TOKEN`、または `GH_TOKEN` を設定してください。"
+            "GitHub認証が見つかりません。認証設定画面からログインしてください。"
         )
 
     repositories = []
@@ -54,9 +81,17 @@ def get_writable_github_repositories():
             )
             response.raise_for_status()
         except requests.RequestException as error:
+            if getattr(error.response, "status_code", None) == 401:
+                delete_credential("github")
+                raise RuntimeError(
+                    "GitHub認証が無効または期限切れです。認証設定画面から再ログインしてください。"
+                ) from error
             raise RuntimeError(f"GitHubリポジトリ一覧を取得できませんでした: {error}") from error
 
-        page_repositories = response.json()
+        try:
+            page_repositories = response.json()
+        except ValueError as error:
+            raise RuntimeError("GitHubからリポジトリ一覧を読み取れませんでした。") from error
         if not isinstance(page_repositories, list):
             raise RuntimeError("GitHubから予期しないリポジトリ一覧が返されました。")
         repositories.extend(
@@ -92,12 +127,14 @@ def set_runtime_callbacks(status_cb=None, cancel_fn=None):
     CURRENT_CANCEL_FN = cancel_fn
 
 def get_available_gemini_models():
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    api_key = get_gemini_api_key()
     if not api_key:
         return ["gemini/gemini-3.8-flash"]
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        res = requests.get(url, timeout=5)
+        url = "https://generativelanguage.googleapis.com/v1beta/models"
+        res = requests.get(
+            url, headers={"x-goog-api-key": api_key}, timeout=5
+        )
         if res.status_code == 200:
             models = []
             excluded = ["2.5", "tts", "image", "audio", "transcribe", "lyria", "robotics", "computer-use", "banana"]
@@ -125,27 +162,63 @@ def normalize_model_name(model: str) -> str:
     return model
 
 def resolve_api_key(model_name: str):
-    if "gemini" in model_name:
-        return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    elif "gpt" in model_name or "o1" in model_name or "o3" in model_name:
-        return os.environ.get("OPENAI_API_KEY")
-    elif "claude" in model_name or "anthropic" in model_name:
-        return os.environ.get("ANTHROPIC_API_KEY")
-    elif "groq" in model_name:
-        return os.environ.get("GROQ_API_KEY")
+    if model_name.startswith("gemini/"):
+        return get_gemini_api_key()
     return None
 
 def call_llm(prompt, model="gemini/gemini-3.8-flash", max_retries=5):
     model = normalize_model_name(model)
     api_key = resolve_api_key(model)
+    copilot_token = get_copilot_token() if model.startswith("github_copilot/") else None
     
-    if not api_key:
-        if "anthropic" in model or "claude" in model:
-            raise RuntimeError("【APIキー未設定】`ANTHROPIC_API_KEY` が設定されていません。")
-        elif "gpt" in model or "o1" in model or "o3" in model:
-            raise RuntimeError("【APIキー未設定】`OPENAI_API_KEY` が設定されていません。")
-        elif "gemini" in model:
-            raise RuntimeError("【APIキー未設定】`GEMINI_API_KEY` が設定されていません。")
+    if model.startswith("gemini/") and not api_key:
+        raise RuntimeError("【認証が必要】Gemini APIキーを認証設定画面で登録してください。")
+    if model.startswith("github_copilot/") and not copilot_token:
+        raise RuntimeError("【認証が必要】GitHub Copilotを認証設定画面で接続してください。")
+    if not model.startswith(("gemini/", "github_copilot/")):
+        raise RuntimeError("このアプリで利用できるAIプロバイダーはGeminiとGitHub Copilotのみです。")
+
+    def completion():
+        if not copilot_token:
+            return litellm.completion(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                api_key=api_key,
+            )
+
+        token_environment = {
+            "GITHUB_COPILOT_TOKEN_DIR": None,
+            "GITHUB_COPILOT_ACCESS_TOKEN_FILE": None,
+            "GITHUB_COPILOT_API_KEY_FILE": None,
+        }
+        previous_environment = {
+            name: os.environ.get(name) for name in token_environment
+        }
+        try:
+            with tempfile.TemporaryDirectory(prefix="ai-orchestrator-copilot-") as token_dir:
+                token_path = Path(token_dir) / "access-token"
+                token_path.write_text(copilot_token, encoding="utf-8")
+                try:
+                    token_path.chmod(0o600)
+                except OSError:
+                    pass
+                os.environ.update(
+                    {
+                        "GITHUB_COPILOT_TOKEN_DIR": token_dir,
+                        "GITHUB_COPILOT_ACCESS_TOKEN_FILE": "access-token",
+                        "GITHUB_COPILOT_API_KEY_FILE": "api-key.json",
+                    }
+                )
+                return litellm.completion(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+        finally:
+            for name, value in previous_environment.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
     delay = 3
     for attempt in range(max_retries):
@@ -159,17 +232,29 @@ def call_llm(prompt, model="gemini/gemini-3.8-flash", max_retries=5):
                 else:
                     CURRENT_STATUS_CB(f"🧠 [{model}] 応答生成中...")
 
-            res = litellm.completion(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                api_key=api_key
-            )
+            res = completion()
             if res and hasattr(res, "choices") and len(res.choices) > 0:
                 return res
         except Exception as e:
             if isinstance(e, CancellationError):
                 raise e
-            err_str = str(e).lower()
+            error_text = str(e)
+            for secret in (api_key, copilot_token):
+                if secret:
+                    error_text = error_text.replace(secret, "[REDACTED]")
+            err_str = error_text.lower()
+            if "401" in err_str and model.startswith("github_copilot/"):
+                delete_credential("copilot")
+                raise RuntimeError(
+                    "【認証が必要】GitHub Copilotの認証が無効または期限切れです。認証設定画面から再接続してください。"
+                ) from e
+            if model.startswith("gemini/") and (
+                "401" in err_str or "api_key_invalid" in err_str or "api key not valid" in err_str
+            ):
+                delete_credential("gemini")
+                raise RuntimeError(
+                    "【認証が必要】Gemini APIキーが無効または期限切れです。認証設定画面から再登録してください。"
+                ) from e
             
             # 日次上限到達は待機せず即時中断
             if ("429" in err_str or "quota" in err_str or "resource_exhausted" in err_str) and ("perday" in err_str or "freetier" in err_str or "daily" in err_str):
@@ -199,7 +284,7 @@ def call_llm(prompt, model="gemini/gemini-3.8-flash", max_retries=5):
                     prefix = "【モデル未提供 (404)】"
                 else:
                     prefix = "【API呼び出しエラー】"
-                raise RuntimeError(f"{prefix} ({model}): {e}")
+                raise RuntimeError(f"{prefix} ({model}): {error_text}")
 
     raise RuntimeError(f"API呼び出しに失敗しました: {model}")
 
@@ -315,13 +400,33 @@ def commit_node(state: DevState):
     try:
         subprocess.run(["git", "config", "--global", "user.name", "ai-orchestrator"], check=True)
         subprocess.run(["git", "config", "--global", "user.email", "orchestrator@agent.local"], check=True)
-        remote_url = f"https://x-access-token:{token}@github.com/{repo}.git"
+        remote_url = f"https://github.com/{repo}.git"
         subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=True)
         subprocess.run(["git", "add", target_file], check=True)
         commit_msg = f"feat/fix: auto update {target_file} by ai-orchestrator"
         subprocess.run(["git", "commit", "-m", commit_msg], check=True)
-        subprocess.run(["git", "pull", "--rebase", "origin", branch], check=False)
-        subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], check=True)
+        git_env = os.environ.copy()
+        credentials = base64.b64encode(
+            f"x-access-token:{token}".encode("utf-8")
+        ).decode("ascii")
+        git_env.update(
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+                "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {credentials}",
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+        )
+        subprocess.run(
+            ["git", "pull", "--rebase", "origin", branch],
+            check=True,
+            env=git_env,
+        )
+        subprocess.run(
+            ["git", "push", "origin", f"HEAD:{branch}"],
+            check=True,
+            env=git_env,
+        )
         print("🎉 GitHubへの自動プッシュ完了！")
     except subprocess.CalledProcessError as e:
         print("⚠️ Git操作でエラー:", e)

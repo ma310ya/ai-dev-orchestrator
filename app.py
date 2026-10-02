@@ -4,16 +4,31 @@ import json
 import os
 import re
 import threading
+import time
 from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
+import requests
+
+from credentials import (
+    delete_credential,
+    save_credential,
+    validate_credentials_configuration,
+)
 from main import (
+    COPILOT_CLIENT_ID,
     dev_workflow,
+    get_copilot_token,
+    get_available_gemini_models,
+    get_gemini_api_key,
+    get_github_token,
+    github_oauth_client_id,
     get_writable_github_repositories,
     get_writable_github_repository,
+    save_gemini_api_key,
     set_runtime_callbacks,
 )
 
@@ -21,14 +36,11 @@ from main import (
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
 MAX_REQUEST_SIZE = 1024 * 1024
-MODEL_SUGGESTIONS = [
-    "gemini/gemini-3.8-flash",
-    "gpt-4o",
-    "gpt-4o-mini",
-    "o3-mini",
-    "anthropic/claude-3-5-sonnet-20241022",
-    "groq/llama-3.3-70b-versatile",
+COPILOT_MODEL_SUGGESTIONS = [
+    "github_copilot/gpt-4o",
+    "github_copilot/claude-sonnet-4",
 ]
+DEFAULT_GEMINI_MODEL = "gemini/gemini-3.8-flash"
 STDLIB_MODULES = set(__import__("sys").builtin_module_names) | {
     "os", "sys", "time", "re", "math", "json", "glob", "shutil", "pathlib",
     "datetime", "subprocess", "random", "collections", "itertools", "functools",
@@ -55,6 +67,182 @@ STATE = {
     "form": {},
     "last_request_text": "",
 }
+AUTH_LOCK = threading.Lock()
+AUTH_FLOWS = {
+    "github": {"status": "idle"},
+    "copilot": {"status": "idle"},
+}
+
+
+def auth_status():
+    storage_error = ""
+    try:
+        validate_credentials_configuration()
+    except RuntimeError as error:
+        storage_error = str(error)
+        with AUTH_LOCK:
+            flows = {
+                provider: {
+                    key: value
+                    for key, value in flow.items()
+                    if key in {"status", "verification_uri", "user_code", "message"}
+                }
+                for provider, flow in AUTH_FLOWS.items()
+            }
+        return {
+            "github": False,
+            "copilot": False,
+            "gemini": False,
+            "storage_error": storage_error,
+            "flows": flows,
+        }
+    with AUTH_LOCK:
+        flows = {
+            provider: {
+                key: value
+                for key, value in flow.items()
+                if key in {"status", "verification_uri", "user_code", "message"}
+            }
+            for provider, flow in AUTH_FLOWS.items()
+        }
+    return {
+        "github": bool(get_github_token()),
+        "copilot": bool(get_copilot_token()),
+        "gemini": bool(get_gemini_api_key()),
+        "storage_error": storage_error,
+        "flows": flows,
+    }
+
+
+def poll_device_flow(provider, device_code, client_id, interval, expires_at):
+    token_url = "https://github.com/login/oauth/access_token"
+    headers = {"Accept": "application/json"}
+    with AUTH_LOCK:
+        AUTH_FLOWS[provider].update(status="waiting", message="ブラウザーで承認してください。")
+    try:
+        while time.time() < expires_at:
+            time.sleep(interval)
+            response = requests.post(
+                token_url,
+                headers=headers,
+                json={
+                    "client_id": client_id,
+                    "device_code": device_code,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                },
+                timeout=15,
+            )
+            try:
+                payload = response.json()
+            except ValueError:
+                response.raise_for_status()
+                raise RuntimeError("GitHubからOAuth応答を読み取れませんでした。")
+            if payload.get("access_token"):
+                token_expiry = payload.get("expires_in")
+                expiry_timestamp = (
+                    time.time() + int(token_expiry) if token_expiry else None
+                )
+                save_credential(provider, payload["access_token"], expiry_timestamp)
+                with AUTH_LOCK:
+                    AUTH_FLOWS[provider] = {
+                        "status": "complete",
+                        "message": "認証が完了しました。",
+                    }
+                return
+            error = payload.get("error")
+            if error == "authorization_pending":
+                continue
+            if error == "slow_down":
+                interval += 5
+                continue
+            if error in {"expired_token", "access_denied"}:
+                raise RuntimeError(
+                    "認証コードの有効期限が切れたか、認証が拒否されました。再度ログインしてください。"
+                )
+            if error:
+                raise RuntimeError(
+                    f"GitHub OAuthでエラーが発生しました: {payload.get('error_description', error)}"
+                )
+            response.raise_for_status()
+            raise RuntimeError("GitHub OAuthからアクセストークンが返されませんでした。")
+        raise RuntimeError("認証コードの有効期限が切れました。再度ログインしてください。")
+    except (OSError, requests.RequestException, RuntimeError, ValueError) as error:
+        with AUTH_LOCK:
+            AUTH_FLOWS[provider].update(status="error", message=str(error))
+
+
+def start_device_flow(provider):
+    if provider not in AUTH_FLOWS:
+        raise ValueError("未対応の認証プロバイダーです。")
+    validate_credentials_configuration()
+    if provider == "github":
+        client_id = github_oauth_client_id()
+        scope = "repo read:user"
+        if not client_id:
+            raise RuntimeError(
+                "GitHub OAuth AppのDevice Flowを有効にし、"
+                "GITHUB_OAUTH_CLIENT_IDをサーバー環境変数に設定してください。"
+            )
+    else:
+        client_id = COPILOT_CLIENT_ID
+        scope = "read:user"
+    with AUTH_LOCK:
+        if AUTH_FLOWS[provider].get("status") in {"starting", "waiting"}:
+            raise ValueError("このプロバイダーの認証はすでに進行中です。")
+        AUTH_FLOWS[provider] = {"status": "starting"}
+    try:
+        response = requests.post(
+            "https://github.com/login/device/code",
+            headers={"Accept": "application/json"},
+            json={"client_id": client_id, "scope": scope},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        verification_uri = payload.get("verification_uri", "")
+        if (
+            not payload.get("device_code")
+            or not payload.get("user_code")
+            or not verification_uri.startswith("https://github.com/")
+        ):
+            raise RuntimeError("GitHubから有効なDevice Flowコードを取得できませんでした。")
+        interval = max(int(payload.get("interval", 5)), 1)
+        expires_at = time.time() + int(payload.get("expires_in", 900))
+        with AUTH_LOCK:
+            AUTH_FLOWS[provider] = {
+                "status": "waiting",
+                "verification_uri": verification_uri,
+                "user_code": payload["user_code"],
+                "message": "表示されたコードをGitHubで承認してください。",
+            }
+        worker = threading.Thread(
+            target=poll_device_flow,
+            args=(provider, payload["device_code"], client_id, interval, expires_at),
+            daemon=True,
+        )
+        worker.start()
+        return {
+            "verification_uri": verification_uri,
+            "user_code": payload["user_code"],
+        }
+    except (requests.RequestException, ValueError, RuntimeError) as error:
+        with AUTH_LOCK:
+            AUTH_FLOWS[provider] = {"status": "error", "message": str(error)}
+        raise RuntimeError(f"GitHub認証を開始できませんでした: {error}") from error
+
+
+def save_gemini_key_from_form(api_key):
+    validate_credentials_configuration()
+    save_gemini_api_key(api_key)
+
+
+def get_model_suggestions():
+    gemini_models = (
+        get_available_gemini_models()
+        if get_gemini_api_key()
+        else [DEFAULT_GEMINI_MODEL]
+    )
+    return gemini_models + COPILOT_MODEL_SUGGESTIONS
 
 
 def extract_pip_packages(code):
@@ -123,6 +311,16 @@ def validate_target_file(target_file):
 
 def start_workflow(form):
     target_file = validate_target_file(form.get("target_file", "").strip())
+    plan_model = form.get("plan_model", "").strip()
+    code_model = form.get("code_model", "").strip()
+    available_models = get_model_suggestions()
+    if plan_model not in available_models or code_model not in available_models:
+        raise ValueError("Plan / Codeモデルには一覧にあるGeminiまたはGitHub Copilotモデルを選択してください。")
+    for model in {plan_model, code_model}:
+        if model.startswith("gemini/") and not get_gemini_api_key():
+            raise ValueError("Gemini APIキーが未登録です。先に認証設定からキーを登録してください。")
+        if model.startswith("github_copilot/") and not get_copilot_token():
+            raise ValueError("GitHub Copilotが未認証です。先に認証設定からログインしてください。")
     repository = get_writable_github_repository(form.get("github_repo", "").strip())
     request_text = form.get("request", "").strip()
     if not request_text:
@@ -143,8 +341,8 @@ def start_workflow(form):
             "target_file": target_file,
             "github_repo": repository["full_name"],
             "github_branch": repository["default_branch"],
-            "plan_model": form.get("plan_model", MODEL_SUGGESTIONS[0]).strip(),
-            "code_model": form.get("code_model", MODEL_SUGGESTIONS[0]).strip(),
+            "plan_model": plan_model,
+            "code_model": code_model,
             "request": request_text,
         }
         worker_form = STATE["form"].copy()
@@ -212,16 +410,19 @@ def render_page(error=""):
     with STATE_LOCK:
         form = STATE["form"].copy()
         spec = STATE["spec"]
-        running = STATE["running"]
     target_files = sorted(
         path.name
         for path in Path(".").glob("*.py")
         if path.name not in {"app.py", "main.py"}
     )
-    options = "".join(
-        f'<option value="{html.escape(name, quote=True)}"></option>'
-        for name in MODEL_SUGGESTIONS
-    )
+    model_suggestions = get_model_suggestions()
+    default_model = model_suggestions[0]
+    plan_model = form.get("plan_model", default_model)
+    code_model = form.get("code_model", default_model)
+    if plan_model not in model_suggestions:
+        plan_model = default_model
+    if code_model not in model_suggestions:
+        code_model = default_model
     target_options = "".join(
         f'<option value="{html.escape(name, quote=True)}"></option>'
         for name in target_files
@@ -238,17 +439,50 @@ def render_page(error=""):
   <style>
     body {{ font: 16px system-ui, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; color: #1f2937; }}
     h1 {{ color: #065f46; }} label {{ display: block; font-weight: 600; margin-top: 1rem; }}
-    input, textarea {{ box-sizing: border-box; width: 100%; padding: .65rem; margin-top: .35rem; border: 1px solid #9ca3af; border-radius: 5px; }}
+    input, textarea, select {{ box-sizing: border-box; width: 100%; padding: .65rem; margin-top: .35rem; border: 1px solid #9ca3af; border-radius: 5px; }}
     textarea {{ min-height: 130px; }} button {{ padding: .7rem 1.1rem; border: 0; border-radius: 5px; cursor: pointer; }}
     .run {{ background: #10b981; color: white; font-weight: 700; }} .cancel {{ background: #fff; color: #dc2626; border: 1px solid #dc2626; }}
     .actions {{ display: flex; gap: .75rem; margin-top: 1.25rem; }} .panel {{ margin-top: 1.5rem; padding: 1rem; background: #f3f4f6; border-radius: 6px; }}
     pre {{ white-space: pre-wrap; overflow-wrap: anywhere; }} .error {{ color: #b91c1c; }} .hint {{ color: #4b5563; font-size: .9rem; }}
+    .auth-row {{ display: grid; grid-template-columns: minmax(180px, 1fr) minmax(220px, 2fr) auto auto; gap: .75rem; align-items: center; margin: .75rem 0; }}
+    .auth-row button {{ background: #2563eb; color: white; }} .auth-row p {{ margin: 0; }}
+    .auth-row .disconnect {{ background: #6b7280; }}
+    @media (max-width: 650px) {{ .auth-row {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
   <h1>🤖 AI開発自律オーケストレーター</h1>
-  <p class="hint">この画面はPython標準ライブラリのHTTPサーバーで動作します。GitHubにログイン済みのアカウントから書き込み可能なリポジトリを取得します。</p>
+  <p class="hint">この画面はPython標準ライブラリのHTTPサーバーで動作します。GitHub / CopilotはDevice Flow、GeminiはAPIキー認証を利用します。認証情報は暗号化してサーバーに保存されます。</p>
   {error_html}
+  <section class="panel">
+    <h2>🔐 認証設定</h2>
+    <p class="hint">認証状態: <span id="auth-message">確認中...</span></p>
+    <p id="storage-error" class="error"></p>
+    <div class="auth-row">
+      <strong>GitHubリポジトリ</strong>
+      <p id="github-auth-status">未認証</p>
+      <button type="button" onclick="startLogin('github')">GitHubにログイン</button>
+      <button class="disconnect" type="button" onclick="disconnectAuth('github')">切断</button>
+    </div>
+    <div class="auth-row">
+      <strong>GitHub Copilot</strong>
+      <p id="copilot-auth-status">未認証</p>
+      <button type="button" onclick="startLogin('copilot')">Copilotにログイン</button>
+      <button class="disconnect" type="button" onclick="disconnectAuth('copilot')">切断</button>
+    </div>
+    <p id="device-flow" class="hint"></p>
+    <form id="gemini-form">
+      <label>Gemini APIキー
+        <input name="api_key" type="password" autocomplete="new-password" placeholder="Google AI Studioで作成したAPIキー" required>
+      </label>
+      <button type="submit">Geminiキーを検証して暗号化保存</button>
+    </form>
+    <div class="auth-row">
+      <p id="gemini-auth-status">Gemini: 未認証</p>
+      <span></span><span></span>
+      <button class="disconnect" type="button" onclick="disconnectAuth('gemini')">キーを削除</button>
+    </div>
+  </section>
   <form method="post" action="/run" enctype="multipart/form-data">
     <label>対象GitHubリポジトリ
       <select id="github-repo" name="github_repo" data-selected="{html.escape(form.get("github_repo", ""), quote=True)}" required>
@@ -260,12 +494,11 @@ def render_page(error=""):
       <input name="target_file" list="target-files" value="{html.escape(form.get("target_file", "new_tool.py"), quote=True)}" required>
       <datalist id="target-files">{target_options}</datalist>
     </label>
-    <label>Planモデル名
-      <input name="plan_model" list="models" value="{html.escape(form.get("plan_model", MODEL_SUGGESTIONS[0]), quote=True)}" required>
+    <label>Planモデル
+      <select name="plan_model">{''.join(f'<option value="{html.escape(name, quote=True)}" {"selected" if plan_model == name else ""}>{html.escape(name)}</option>' for name in model_suggestions)}</select>
     </label>
-    <label>Codeモデル名
-      <input name="code_model" list="models" value="{html.escape(form.get("code_model", MODEL_SUGGESTIONS[0]), quote=True)}" required>
-      <datalist id="models">{options}</datalist>
+    <label>Codeモデル
+      <select name="code_model">{''.join(f'<option value="{html.escape(name, quote=True)}" {"selected" if code_model == name else ""}>{html.escape(name)}</option>' for name in model_suggestions)}</select>
     </label>
     <label>要件・指示・エラーログ
       <textarea name="request" placeholder="作成・修正したい内容を入力してください">{html.escape(form.get("request", ""))}</textarea>
@@ -294,6 +527,61 @@ def render_page(error=""):
     <h3>エラー詳細</h3><pre id="result-error"></pre>
   </section>
   <script>
+    async function refreshAuthStatus() {{
+      try {{
+        const response = await fetch('/auth/status', {{ cache: 'no-store' }});
+        const auth = await response.json();
+        document.getElementById('github-auth-status').textContent = auth.github ? '接続済み' : '未接続（ログインしてください）';
+        document.getElementById('copilot-auth-status').textContent = auth.copilot ? '接続済み' : '未接続（Copilot契約が必要）';
+        document.getElementById('gemini-auth-status').textContent = auth.gemini ? 'Gemini: 接続済み' : 'Gemini: 未接続（APIキーを登録してください）';
+        document.getElementById('storage-error').textContent = auth.storage_error || '';
+        const flow = [auth.flows.github, auth.flows.copilot].find(item => item.verification_uri) || auth.flows.github || auth.flows.copilot;
+        if (flow.verification_uri && flow.user_code) {{
+          const deviceFlow = document.getElementById('device-flow');
+          deviceFlow.replaceChildren();
+          const link = document.createElement('a');
+          link.href = flow.verification_uri;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.textContent = 'GitHubの認証ページを開く';
+          const code = document.createElement('strong');
+          code.textContent = flow.user_code;
+          deviceFlow.append(link, document.createTextNode(' にアクセスし、コード '), code, document.createTextNode(' を入力してください。 ' + (flow.message || '')));
+        }} else {{
+          document.getElementById('device-flow').textContent = flow.message || '';
+        }}
+        if (auth.github && auth.copilot && auth.gemini) document.getElementById('auth-message').textContent = 'すべて接続済み';
+        else document.getElementById('auth-message').textContent = '未接続のサービスを認証してください';
+      }} catch (exception) {{
+        document.getElementById('auth-message').textContent = '認証状態を取得できません: ' + exception.message;
+      }}
+    }}
+    async function startLogin(provider) {{
+      const loginWindow = window.open('about:blank', '_blank');
+      if (loginWindow) loginWindow.opener = null;
+      const response = await fetch('/auth/' + provider + '/start', {{ method: 'POST' }});
+      const data = await response.json();
+      if (!response.ok) document.getElementById('device-flow').textContent = data.error;
+      if (response.ok && data.verification_uri && loginWindow) loginWindow.location.href = data.verification_uri;
+      else if (loginWindow) loginWindow.close();
+      await refreshAuthStatus();
+    }}
+    async function disconnectAuth(provider) {{
+      const response = await fetch('/auth/' + provider + '/disconnect', {{ method: 'POST' }});
+      const data = await response.json();
+      if (!response.ok) document.getElementById('auth-message').textContent = data.error;
+      await refreshAuthStatus();
+      loadRepositories();
+    }}
+    document.getElementById('gemini-form').addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      const form = new FormData(event.currentTarget);
+      const response = await fetch('/auth/gemini', {{ method: 'POST', body: new URLSearchParams(form) }});
+      const data = await response.json();
+      document.getElementById('gemini-auth-status').textContent = data.message || data.error;
+      if (response.ok) event.currentTarget.reset();
+      refreshAuthStatus();
+    }});
     async function loadRepositories() {{
       const select = document.getElementById('github-repo');
       const error = document.getElementById('repo-error');
@@ -340,7 +628,9 @@ def render_page(error=""):
       updateStatus();
     }}
     loadRepositories();
+    refreshAuthStatus();
     updateStatus();
+    setInterval(refreshAuthStatus, 2000);
     setInterval(updateStatus, 1500);
   </script>
 </body>
@@ -349,7 +639,12 @@ def render_page(error=""):
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/repos":
+        if self.path == "/auth/status":
+            try:
+                self.send_json(auth_status())
+            except RuntimeError as error:
+                self.send_json({"error": str(error)}, status=500)
+        elif self.path == "/repos":
             try:
                 payload = {"repositories": get_writable_github_repositories()}
                 status = 200
@@ -385,6 +680,34 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if self.path in {"/auth/github/start", "/auth/copilot/start"}:
+            provider = self.path.split("/")[2]
+            try:
+                result = start_device_flow(provider)
+                self.send_json(result)
+            except (RuntimeError, ValueError) as error:
+                self.send_json({"error": str(error)}, status=400)
+            return
+        if self.path in {
+            "/auth/github/disconnect",
+            "/auth/copilot/disconnect",
+            "/auth/gemini/disconnect",
+        }:
+            provider = self.path.split("/")[2]
+            try:
+                delete_credential(provider)
+                self.send_json({"message": "保存済み認証情報を削除しました。"})
+            except RuntimeError as error:
+                self.send_json({"error": str(error)}, status=400)
+            return
+        if self.path == "/auth/gemini":
+            try:
+                form = parse_form(self)
+                save_gemini_key_from_form(form.get("api_key", "").strip())
+                self.send_json({"message": "Gemini APIキーを確認し、暗号化保存しました。"})
+            except (UnicodeDecodeError, RuntimeError, ValueError) as error:
+                self.send_json({"error": str(error)}, status=400)
+            return
         if self.path == "/cancel":
             with STATE_LOCK:
                 if STATE["running"]:
@@ -410,6 +733,15 @@ class Handler(BaseHTTPRequestHandler):
         body = content.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_json(self, payload, status=200):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
