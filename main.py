@@ -51,7 +51,9 @@ def save_gemini_api_key(api_key: str):
     save_credential("gemini", api_key)
 
 def github_oauth_client_id():
-    return os.environ.get("GITHUB_OAUTH_CLIENT_ID", "").strip()
+    return os.environ.get(
+        "GITHUB_OAUTH_CLIENT_ID", "Ov23lix5FI3bxTu1PV2N"
+    ).strip()
 
 def get_writable_github_repositories():
     token = get_github_token()

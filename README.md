@@ -16,7 +16,14 @@
    python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
    ```
 
-3. GitHub OAuth Appを作成し、Device Flowを有効にして、AppのClient IDを `GITHUB_OAUTH_CLIENT_ID` 環境変数に設定します。GitHub認証はリポジトリ一覧取得と書き込みのため `repo` スコープを要求します。Codespaces以外の一般サーバーでも同じ設定が必要です。CopilotのDevice FlowはLiteLLMのGitHub Copilot連携を利用します。
+3. GitHubリポジトリ操作用OAuth Appを一度だけ登録します。GitHubの **Settings → Developer settings → OAuth Apps → New OAuth App** で次を入力してください。
+
+   - Application name: `AI Dev Orchestrator`
+   - Homepage URL: `https://github.com/ma310ya/ai-dev-orchestrator`
+   - Authorization callback URL / Redirect URI: `https://github.com/ma310ya/ai-dev-orchestrator`（Device Flowでは使用しませんが、登録フォームで必須の場合に入力）
+   - **Enable Device Flow**: 有効
+
+   登録後に表示されるClient IDが、このアプリ共通の公開識別子です。現在のClient IDはアプリに組み込み済みのため、通常は追加の設定は不要です。別のOAuth Appを使う場合だけ、サーバーの `GITHUB_OAUTH_CLIENT_ID` 環境変数で上書きしてください。Client secretはDevice Flowでは使わず、アプリに設定しないでください。このClient IDを使って各利用者が自分のGitHubアカウントでログインします。GitHub認証は書き込み可能なリポジトリ一覧と同期のため `repo` スコープを要求します。GitHub OAuth AppのDevice FlowはGitHub.comで有効にしてください。CopilotのDevice FlowはLiteLLMのGitHub Copilot連携を利用します。
 4. アプリを起動します。
 
    ```bash
