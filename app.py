@@ -5,8 +5,6 @@ import os
 import re
 import threading
 import time
-from email.parser import BytesParser
-from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -64,7 +62,6 @@ STATE = {
     "result": None,
     "error": "",
     "form": {},
-    "last_request_text": "",
 }
 AUTH_LOCK = threading.Lock()
 AUTH_FLOWS = {
@@ -284,31 +281,10 @@ def extract_pip_packages(code):
 
 
 def parse_form(handler):
-    content_type = handler.headers.get("Content-Type", "")
     length = int(handler.headers.get("Content-Length", "0"))
     if length < 0 or length > MAX_REQUEST_SIZE:
         raise ValueError("送信サイズは1MB以下にしてください。")
     body = handler.rfile.read(length)
-    if content_type.lower().startswith("multipart/form-data"):
-        envelope = (
-            f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode()
-            + body
-        )
-        message = BytesParser(policy=default).parsebytes(envelope)
-        fields = {}
-        for part in message.iter_parts():
-            name = part.get_param("name", header="content-disposition")
-            if not name:
-                continue
-            value = part.get_payload(decode=True) or b""
-            if part.get_filename():
-                if name == "spec_file" and value:
-                    fields["uploaded_spec"] = value.decode("utf-8")
-            else:
-                charset = part.get_content_charset() or "utf-8"
-                fields[name] = value.decode(charset)
-        return fields
-
     parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
     return {key: values[-1] for key, values in parsed.items()}
 
@@ -323,7 +299,7 @@ def validate_target_file(target_file):
         or not target_file.endswith(".py")
         or target_file in {"app.py", "main.py"}
     ):
-        raise ValueError("対象ファイルには app.py / main.py 以外の .py ファイル名を指定してください。")
+        raise ValueError("保存先ファイル名には app.py / main.py 以外の .py ファイル名を指定してください。")
     return target_file
 
 
@@ -333,7 +309,7 @@ def start_workflow(form):
     code_model = form.get("code_model", "").strip()
     available_models = get_model_suggestions()
     if plan_model not in available_models or code_model not in available_models:
-        raise ValueError("Plan / Codeモデルには一覧にあるGeminiまたはGitHub Copilotモデルを選択してください。")
+        raise ValueError("仕様書生成AI / コーディングAIには一覧にあるGeminiまたはGitHub Copilotモデルを選択してください。")
     for model in {plan_model, code_model}:
         if model.startswith("gemini/") and not get_gemini_api_key():
             raise ValueError("Gemini APIキーが未登録です。先に認証設定からキーを登録してください。")
@@ -342,17 +318,13 @@ def start_workflow(form):
     repository = get_writable_github_repository(form.get("github_repo", "").strip())
     request_text = form.get("request", "").strip()
     if not request_text:
-        request_text = form.get("uploaded_spec", "").strip()
+        raise ValueError("要件・指示を入力してください。")
     with STATE_LOCK:
         if STATE["running"]:
             raise ValueError("別のパイプラインが実行中です。")
-        saved_spec = form.get("spec", "").strip()
-        if request_text != STATE["last_request_text"]:
-            saved_spec = ""
-        STATE["last_request_text"] = request_text
         STATE["running"] = True
         STATE["logs"] = []
-        STATE["spec"] = saved_spec
+        STATE["spec"] = ""
         STATE["result"] = None
         STATE["error"] = ""
         STATE["form"] = {
@@ -368,13 +340,13 @@ def start_workflow(form):
 
     worker = threading.Thread(
         target=run_workflow,
-        args=(worker_form, saved_spec),
+        args=(worker_form,),
         daemon=True,
     )
     worker.start()
 
 
-def run_workflow(form, saved_spec):
+def run_workflow(form):
     def log_status(message):
         with STATE_LOCK:
             STATE["logs"].append(str(message))
@@ -394,7 +366,7 @@ def run_workflow(form, saved_spec):
                 "code_model": form["code_model"],
                 "github_repo": form["github_repo"],
                 "github_branch": form["github_branch"],
-                "spec": saved_spec,
+                "spec": "",
                 "code": "",
                 "test_result": "",
                 "iteration": 0,
@@ -427,7 +399,6 @@ def run_workflow(form, saved_spec):
 def render_page(error=""):
     with STATE_LOCK:
         form = STATE["form"].copy()
-        spec = STATE["spec"]
     target_files = sorted(
         path.name
         for path in Path(".").glob("*.py")
@@ -492,6 +463,7 @@ def render_page(error=""):
       <label>Gemini APIキー
         <input name="api_key" type="password" autocomplete="new-password" placeholder="Google AI Studioで作成したAPIキー" required>
       </label>
+      <p class="hint">Google AI StudioでAPIキーを作成し、ここに貼り付けてください。<a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer">Gemini APIキーを取得する</a></p>
       <button type="submit">Geminiキーを検証して暗号化保存</button>
     </form>
     <div class="auth-row">
@@ -500,33 +472,27 @@ def render_page(error=""):
       <button class="disconnect" type="button" onclick="disconnectAuth('gemini')">キーを削除</button>
     </div>
   </section>
-  <form method="post" action="/run" enctype="multipart/form-data">
-    <label>対象GitHubリポジトリ
+  <form method="post" action="/run">
+    <label>生成コード保存先リポジトリ
       <select id="github-repo" name="github_repo" data-selected="{html.escape(form.get("github_repo", ""), quote=True)}" required>
         <option value="">リポジトリ一覧を読み込み中...</option>
       </select>
     </label>
     <button type="button" onclick="loadRepositories()">リポジトリ一覧を再取得</button>
     <p id="repo-error" class="error"></p>
-    <label>対象ファイル (.py)
+    <label>保存先ファイル名 (.py)
       <input name="target_file" list="target-files" value="{html.escape(form.get("target_file", ""), quote=True)}" required>
       <datalist id="target-files">{target_options}</datalist>
     </label>
-    <label>Planモデル
+    <label>仕様書生成AI
       <select name="plan_model"><option value="" {"selected" if not plan_model else ""}>モデルを選択してください</option>{''.join(f'<option value="{html.escape(name, quote=True)}" {"selected" if plan_model == name else ""}>{html.escape(name)}</option>' for name in model_suggestions)}</select>
     </label>
-    <label>Codeモデル
+    <label>コーディングAI
       <select name="code_model"><option value="" {"selected" if not code_model else ""}>モデルを選択してください</option>{''.join(f'<option value="{html.escape(name, quote=True)}" {"selected" if code_model == name else ""}>{html.escape(name)}</option>' for name in model_suggestions)}</select>
     </label>
     <p id="model-hint" class="hint">GeminiモデルはGemini APIキーを登録すると選択肢に追加されます。</p>
-    <label>要件・指示・エラーログ
-      <textarea name="request" placeholder="作成・修正したい内容を入力してください">{html.escape(form.get("request", ""))}</textarea>
-    </label>
-    <label>要件定義ファイル (.md / .txt)
-      <input type="file" name="spec_file" accept=".md,.txt,text/plain">
-    </label>
-    <label>保存済み仕様書（編集可能）
-      <textarea id="spec" name="spec">{html.escape(spec)}</textarea>
+    <label>要件・指示
+      <textarea name="request" placeholder="作成・修正したい内容や追加の指示を入力してください" required>{html.escape(form.get("request", ""))}</textarea>
     </label>
     <div class="actions">
       <button id="run" class="run" type="submit">🚀 開発パイプラインを実行</button>
