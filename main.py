@@ -257,6 +257,14 @@ def call_llm(prompt, model="gemini/gemini-3.8-flash", max_retries=5):
                 raise RuntimeError(
                     "【認証が必要】Gemini APIキーが無効または期限切れです。認証設定画面から再登録してください。"
                 ) from e
+            if model.startswith("github_copilot/") and (
+                "requested model is not supported" in err_str
+                or "model is not supported" in err_str
+            ):
+                raise RuntimeError(
+                    f"【Copilotモデル未対応】`{model}` は現在のCopilotアカウントで利用できません。"
+                    "モデル一覧から別のCopilotモデル、またはGeminiモデルを選択してください。"
+                ) from e
             
             # 日次上限到達は待機せず即時中断
             if ("429" in err_str or "quota" in err_str or "resource_exhausted" in err_str) and ("perday" in err_str or "freetier" in err_str or "daily" in err_str):

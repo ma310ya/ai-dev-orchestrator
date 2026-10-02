@@ -38,7 +38,6 @@ PORT = int(os.environ.get("PORT", "8000"))
 MAX_REQUEST_SIZE = 1024 * 1024
 COPILOT_MODEL_SUGGESTIONS = [
     "github_copilot/gpt-4o",
-    "github_copilot/claude-sonnet-4",
 ]
 STDLIB_MODULES = set(__import__("sys").builtin_module_names) | {
     "os", "sys", "time", "re", "math", "json", "glob", "shutil", "pathlib",
