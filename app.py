@@ -5,6 +5,8 @@ import os
 import re
 import threading
 import time
+from email.parser import BytesParser
+from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -62,6 +64,7 @@ STATE = {
     "result": None,
     "error": "",
     "form": {},
+    "last_request_text": "",
 }
 AUTH_LOCK = threading.Lock()
 AUTH_FLOWS = {
@@ -281,10 +284,31 @@ def extract_pip_packages(code):
 
 
 def parse_form(handler):
+    content_type = handler.headers.get("Content-Type", "")
     length = int(handler.headers.get("Content-Length", "0"))
     if length < 0 or length > MAX_REQUEST_SIZE:
         raise ValueError("送信サイズは1MB以下にしてください。")
     body = handler.rfile.read(length)
+    if content_type.lower().startswith("multipart/form-data"):
+        envelope = (
+            f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode()
+            + body
+        )
+        message = BytesParser(policy=default).parsebytes(envelope)
+        fields = {}
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if not name:
+                continue
+            value = part.get_payload(decode=True) or b""
+            if part.get_filename():
+                if name == "spec_file" and value:
+                    fields["uploaded_spec"] = value.decode("utf-8")
+            else:
+                charset = part.get_content_charset() or "utf-8"
+                fields[name] = value.decode(charset)
+        return fields
+
     parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
     return {key: values[-1] for key, values in parsed.items()}
 
@@ -316,15 +340,26 @@ def start_workflow(form):
         if model.startswith("github_copilot/") and not get_copilot_token():
             raise ValueError("GitHub Copilotが未認証です。先に認証設定からログインしてください。")
     repository = get_writable_github_repository(form.get("github_repo", "").strip())
-    request_text = form.get("request", "").strip()
+    original_request_text = form.get("request", "").strip()
+    request_text = original_request_text
+    uploaded_spec = form.get("uploaded_spec", "").strip()
+    if uploaded_spec:
+        if request_text:
+            request_text += f"\n\n【添付された要件定義】\n{uploaded_spec}"
+        else:
+            request_text = uploaded_spec
     if not request_text:
         raise ValueError("要件・指示を入力してください。")
     with STATE_LOCK:
         if STATE["running"]:
             raise ValueError("別のパイプラインが実行中です。")
+        saved_spec = form.get("spec", "").strip()
+        if request_text != STATE["last_request_text"]:
+            saved_spec = ""
+        STATE["last_request_text"] = request_text
         STATE["running"] = True
         STATE["logs"] = []
-        STATE["spec"] = ""
+        STATE["spec"] = saved_spec
         STATE["result"] = None
         STATE["error"] = ""
         STATE["form"] = {
@@ -333,20 +368,21 @@ def start_workflow(form):
             "github_branch": repository["default_branch"],
             "plan_model": plan_model,
             "code_model": code_model,
-            "request": request_text,
+            "request": original_request_text,
         }
         worker_form = STATE["form"].copy()
+        worker_form["request"] = request_text
         CANCEL_EVENT.clear()
 
     worker = threading.Thread(
         target=run_workflow,
-        args=(worker_form,),
+        args=(worker_form, saved_spec),
         daemon=True,
     )
     worker.start()
 
 
-def run_workflow(form):
+def run_workflow(form, saved_spec):
     def log_status(message):
         with STATE_LOCK:
             STATE["logs"].append(str(message))
@@ -366,7 +402,7 @@ def run_workflow(form):
                 "code_model": form["code_model"],
                 "github_repo": form["github_repo"],
                 "github_branch": form["github_branch"],
-                "spec": "",
+                "spec": saved_spec,
                 "code": "",
                 "test_result": "",
                 "iteration": 0,
@@ -399,6 +435,7 @@ def run_workflow(form):
 def render_page(error=""):
     with STATE_LOCK:
         form = STATE["form"].copy()
+        spec = STATE["spec"]
     target_files = sorted(
         path.name
         for path in Path(".").glob("*.py")
@@ -472,7 +509,7 @@ def render_page(error=""):
       <button class="disconnect" type="button" onclick="disconnectAuth('gemini')">キーを削除</button>
     </div>
   </section>
-  <form method="post" action="/run">
+  <form method="post" action="/run" enctype="multipart/form-data">
     <label>生成コード保存先リポジトリ
       <select id="github-repo" name="github_repo" data-selected="{html.escape(form.get("github_repo", ""), quote=True)}" required>
         <option value="">リポジトリ一覧を読み込み中...</option>
@@ -494,6 +531,13 @@ def render_page(error=""):
     <label>要件・指示
       <textarea name="request" placeholder="作成・修正したい内容や追加の指示を入力してください" required>{html.escape(form.get("request", ""))}</textarea>
     </label>
+    <label>要件定義ファイル (.md / .txt)
+      <input type="file" name="spec_file" accept=".md,.txt,text/plain">
+    </label>
+    <label>保存済み仕様書（編集可能）
+      <textarea id="spec" name="spec">{html.escape(spec)}</textarea>
+    </label>
+    <p class="hint">仕様書生成AIが作成した内容を表示します。内容を編集して再実行すると、その仕様書を使ってコードを生成します（要件・添付ファイルを変更すると新しい仕様書を作成します）。</p>
     <div class="actions">
       <button id="run" class="run" type="submit">🚀 開発パイプラインを実行</button>
       <button id="cancel" class="cancel" type="button" onclick="cancelRun()">🛑 処理をキャンセル</button>
