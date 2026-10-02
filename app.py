@@ -555,14 +555,30 @@ def render_page(error=""):
       }}
     }}
     async function startLogin(provider) {{
-      const loginWindow = window.open('about:blank', '_blank');
-      if (loginWindow) loginWindow.opener = null;
-      const response = await fetch('/auth/' + provider + '/start', {{ method: 'POST' }});
-      const data = await response.json();
-      if (!response.ok) document.getElementById('device-flow').textContent = data.error;
-      if (response.ok && data.verification_uri && loginWindow) loginWindow.location.href = data.verification_uri;
-      else if (loginWindow) loginWindow.close();
-      await refreshAuthStatus();
+      const message = document.getElementById('device-flow');
+      message.textContent = 'GitHub認証を開始しています...';
+      try {{
+        const response = await fetch('/auth/' + provider + '/start', {{ method: 'POST' }});
+        const data = await response.json();
+        if (!response.ok) {{
+          message.textContent = data.error || '認証を開始できませんでした。';
+          return;
+        }}
+        if (data.verification_uri && data.user_code) {{
+          message.replaceChildren();
+          const link = document.createElement('a');
+          link.href = data.verification_uri;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.textContent = 'GitHubの認証ページを開く';
+          const code = document.createElement('strong');
+          code.textContent = data.user_code;
+          message.append(link, document.createTextNode(' にアクセスし、コード '), code, document.createTextNode(' を入力してください。'));
+        }}
+        await refreshAuthStatus();
+      }} catch (exception) {{
+        message.textContent = '認証を開始できませんでした: ' + exception.message;
+      }}
     }}
     async function disconnectAuth(provider) {{
       const response = await fetch('/auth/' + provider + '/disconnect', {{ method: 'POST' }});

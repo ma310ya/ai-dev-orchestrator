@@ -22,9 +22,44 @@ def _credentials_path():
 def _fernet():
     key = os.environ.get("APP_CREDENTIALS_KEY")
     if not key:
-        raise RuntimeError(
-            "認証情報の暗号化鍵 APP_CREDENTIALS_KEY が未設定です。"
-        )
+        key_path = _credentials_path().with_name("credentials.key")
+        with _LOCK:
+            try:
+                key = key_path.read_text(encoding="ascii").strip()
+            except FileNotFoundError:
+                key_path.parent.mkdir(parents=True, exist_ok=True)
+                key = Fernet.generate_key().decode("ascii")
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w",
+                        encoding="ascii",
+                        dir=key_path.parent,
+                        delete=False,
+                    ) as file:
+                        temporary = Path(file.name)
+                        file.write(key)
+                        file.flush()
+                        os.fsync(file.fileno())
+                        try:
+                            os.fchmod(file.fileno(), 0o600)
+                        except OSError:
+                            pass
+                    try:
+                        os.replace(temporary, key_path)
+                    except FileExistsError:
+                        key = key_path.read_text(encoding="ascii").strip()
+                    try:
+                        key_path.chmod(0o600)
+                    except OSError:
+                        pass
+                finally:
+                    if temporary and temporary.exists():
+                        temporary.unlink()
+            except OSError as error:
+                raise RuntimeError(
+                    f"暗号化鍵を読み書きできません: {key_path}"
+                ) from error
     try:
         return Fernet(key.encode("ascii"))
     except (ValueError, UnicodeEncodeError) as error:
