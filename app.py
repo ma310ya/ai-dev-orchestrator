@@ -40,7 +40,6 @@ COPILOT_MODEL_SUGGESTIONS = [
     "github_copilot/gpt-4o",
     "github_copilot/claude-sonnet-4",
 ]
-DEFAULT_GEMINI_MODEL = "gemini/gemini-3.8-flash"
 STDLIB_MODULES = set(__import__("sys").builtin_module_names) | {
     "os", "sys", "time", "re", "math", "json", "glob", "shutil", "pathlib",
     "datetime", "subprocess", "random", "collections", "itertools", "functools",
@@ -240,7 +239,7 @@ def get_model_suggestions():
     gemini_models = (
         get_available_gemini_models()
         if get_gemini_api_key()
-        else [DEFAULT_GEMINI_MODEL]
+        else []
     )
     return gemini_models + COPILOT_MODEL_SUGGESTIONS
 
@@ -416,13 +415,12 @@ def render_page(error=""):
         if path.name not in {"app.py", "main.py"}
     )
     model_suggestions = get_model_suggestions()
-    default_model = model_suggestions[0]
-    plan_model = form.get("plan_model", default_model)
-    code_model = form.get("code_model", default_model)
+    plan_model = form.get("plan_model", "")
+    code_model = form.get("code_model", "")
     if plan_model not in model_suggestions:
-        plan_model = default_model
+        plan_model = ""
     if code_model not in model_suggestions:
-        code_model = default_model
+        code_model = ""
     target_options = "".join(
         f'<option value="{html.escape(name, quote=True)}"></option>'
         for name in target_files
@@ -491,14 +489,14 @@ def render_page(error=""):
     </label>
     <p id="repo-error" class="error"></p>
     <label>対象ファイル (.py)
-      <input name="target_file" list="target-files" value="{html.escape(form.get("target_file", "new_tool.py"), quote=True)}" required>
+      <input name="target_file" list="target-files" value="{html.escape(form.get("target_file", ""), quote=True)}" required>
       <datalist id="target-files">{target_options}</datalist>
     </label>
     <label>Planモデル
-      <select name="plan_model">{''.join(f'<option value="{html.escape(name, quote=True)}" {"selected" if plan_model == name else ""}>{html.escape(name)}</option>' for name in model_suggestions)}</select>
+      <select name="plan_model"><option value="" {"selected" if not plan_model else ""}>モデルを選択してください</option>{''.join(f'<option value="{html.escape(name, quote=True)}" {"selected" if plan_model == name else ""}>{html.escape(name)}</option>' for name in model_suggestions)}</select>
     </label>
     <label>Codeモデル
-      <select name="code_model">{''.join(f'<option value="{html.escape(name, quote=True)}" {"selected" if code_model == name else ""}>{html.escape(name)}</option>' for name in model_suggestions)}</select>
+      <select name="code_model"><option value="" {"selected" if not code_model else ""}>モデルを選択してください</option>{''.join(f'<option value="{html.escape(name, quote=True)}" {"selected" if code_model == name else ""}>{html.escape(name)}</option>' for name in model_suggestions)}</select>
     </label>
     <label>要件・指示・エラーログ
       <textarea name="request" placeholder="作成・修正したい内容を入力してください">{html.escape(form.get("request", ""))}</textarea>
