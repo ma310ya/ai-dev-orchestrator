@@ -506,6 +506,7 @@ def render_page(error=""):
         <option value="">リポジトリ一覧を読み込み中...</option>
       </select>
     </label>
+    <button type="button" onclick="loadRepositories()">リポジトリ一覧を再取得</button>
     <p id="repo-error" class="error"></p>
     <label>対象ファイル (.py)
       <input name="target_file" list="target-files" value="{html.escape(form.get("target_file", ""), quote=True)}" required>
@@ -517,6 +518,7 @@ def render_page(error=""):
     <label>Codeモデル
       <select name="code_model"><option value="" {"selected" if not code_model else ""}>モデルを選択してください</option>{''.join(f'<option value="{html.escape(name, quote=True)}" {"selected" if code_model == name else ""}>{html.escape(name)}</option>' for name in model_suggestions)}</select>
     </label>
+    <p id="model-hint" class="hint">GeminiモデルはGemini APIキーを登録すると選択肢に追加されます。</p>
     <label>要件・指示・エラーログ
       <textarea name="request" placeholder="作成・修正したい内容を入力してください">{html.escape(form.get("request", ""))}</textarea>
     </label>
@@ -544,6 +546,8 @@ def render_page(error=""):
     <h3>エラー詳細</h3><pre id="result-error"></pre>
   </section>
   <script>
+    let previousGithubAuth = null;
+    let previousGeminiAuth = null;
     async function refreshAuthStatus() {{
       try {{
         const response = await fetch('/auth/status', {{ cache: 'no-store' }});
@@ -552,6 +556,14 @@ def render_page(error=""):
         document.getElementById('copilot-auth-status').textContent = auth.copilot ? '接続済み' : '未接続（Copilot契約が必要）';
         document.getElementById('gemini-auth-status').textContent = auth.gemini ? 'Gemini: 接続済み' : 'Gemini: 未接続（APIキーを登録してください）';
         document.getElementById('storage-error').textContent = auth.storage_error || '';
+        if (previousGithubAuth !== auth.github) {{
+          previousGithubAuth = auth.github;
+          await loadRepositories();
+        }}
+        if (previousGeminiAuth !== auth.gemini) {{
+          previousGeminiAuth = auth.gemini;
+          await loadModels();
+        }}
         const flow = [auth.flows.github, auth.flows.copilot].find(item => item.verification_uri) || auth.flows.github || auth.flows.copilot;
         if (flow.verification_uri && flow.user_code) {{
           const deviceFlow = document.getElementById('device-flow');
@@ -613,11 +625,13 @@ def render_page(error=""):
       const data = await response.json();
       document.getElementById('gemini-auth-status').textContent = data.message || data.error;
       if (response.ok) event.currentTarget.reset();
-      refreshAuthStatus();
+      await refreshAuthStatus();
     }});
     async function loadRepositories() {{
       const select = document.getElementById('github-repo');
       const error = document.getElementById('repo-error');
+      const selectedValue = select.value || select.dataset.selected;
+      error.textContent = 'リポジトリ一覧を取得しています...';
       try {{
         const response = await fetch('/repos', {{ cache: 'no-store' }});
         const data = await response.json();
@@ -626,11 +640,36 @@ def render_page(error=""):
         for (const repo of data.repositories) {{
           select.add(new Option(repo.full_name + ' (' + repo.default_branch + ')', repo.full_name));
         }}
-        select.value = select.dataset.selected;
-        if (!data.repositories.length) error.textContent = '書き込み可能なリポジトリがありません。';
+        select.value = selectedValue;
+        error.textContent = data.repositories.length
+          ? data.repositories.length + ' 件のリポジトリを取得しました。'
+          : '書き込み可能なリポジトリがありません。';
       }} catch (exception) {{
         select.replaceChildren(new Option('リポジトリ一覧を取得できません', ''));
         error.textContent = exception.message;
+      }}
+    }}
+    async function loadModels() {{
+      const selects = [
+        document.querySelector('select[name="plan_model"]'),
+        document.querySelector('select[name="code_model"]')
+      ];
+      const selectedValues = selects.map(select => select.value);
+      const hint = document.getElementById('model-hint');
+      try {{
+        const response = await fetch('/models', {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'モデル一覧を取得できませんでした。');
+        selects.forEach((select, index) => {{
+          select.replaceChildren(new Option('モデルを選択してください', ''));
+          for (const model of data.models) select.add(new Option(model, model));
+          select.value = data.models.includes(selectedValues[index]) ? selectedValues[index] : '';
+        }});
+        hint.textContent = data.gemini_configured
+          ? 'Gemini APIキーで利用可能なモデルを取得しました。'
+          : 'GeminiモデルはGemini APIキーを登録すると選択肢に追加されます。';
+      }} catch (exception) {{
+        hint.textContent = exception.message;
       }}
     }}
     async function updateStatus() {{
@@ -660,7 +699,6 @@ def render_page(error=""):
       await fetch('/cancel', {{ method: 'POST' }});
       updateStatus();
     }}
-    loadRepositories();
     refreshAuthStatus();
     updateStatus();
     setInterval(refreshAuthStatus, 2000);
@@ -675,6 +713,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/auth/status":
             try:
                 self.send_json(auth_status())
+            except RuntimeError as error:
+                self.send_json({"error": str(error)}, status=500)
+        elif self.path == "/models":
+            try:
+                self.send_json(
+                    {
+                        "models": get_model_suggestions(),
+                        "gemini_configured": bool(get_gemini_api_key()),
+                    }
+                )
             except RuntimeError as error:
                 self.send_json({"error": str(error)}, status=500)
         elif self.path == "/repos":
