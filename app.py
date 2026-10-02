@@ -193,11 +193,30 @@ def start_device_flow(provider):
         response = requests.post(
             "https://github.com/login/device/code",
             headers={"Accept": "application/json"},
-            json={"client_id": client_id, "scope": scope},
+            data={"client_id": client_id, "scope": scope},
             timeout=15,
         )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as error:
+            response.raise_for_status()
+            raise RuntimeError("GitHubからOAuth応答を読み取れませんでした。") from error
+        if not isinstance(payload, dict):
+            raise RuntimeError("GitHubから予期しないOAuth応答が返されました。")
+        if not response.ok:
+            oauth_error = payload.get("error")
+            description = payload.get("error_description", "")
+            if oauth_error in {"device_flow_disabled", "invalid_client"}:
+                raise RuntimeError(
+                    "GitHub OAuth AppがDevice Flowを受け付けませんでした。"
+                    "OAuth Appの設定で「Enable Device Flow」を有効にして保存し、"
+                    "Client IDがアプリのものと一致することを確認してください。"
+                    f" GitHubの応答: {description or oauth_error}"
+                )
+            raise RuntimeError(
+                f"GitHub OAuth開始に失敗しました (HTTP {response.status_code}): "
+                f"{description or oauth_error or '詳細なし'}"
+            )
         verification_uri = payload.get("verification_uri", "")
         if (
             not payload.get("device_code")

@@ -23,7 +23,7 @@
    - Authorization callback URL / Redirect URI: `https://github.com/ma310ya/ai-dev-orchestrator`（Device Flowでは使用しませんが、登録フォームで必須の場合に入力）
    - **Enable Device Flow**: 有効
 
-   登録後に表示されるClient IDが、このアプリ共通の公開識別子です。現在のClient IDはアプリに組み込み済みのため、通常は追加の設定は不要です。別のOAuth Appを使う場合だけ、サーバーの `GITHUB_OAUTH_CLIENT_ID` 環境変数で上書きしてください。Client secretはDevice Flowでは使わず、アプリに設定しないでください。このClient IDを使って各利用者が自分のGitHubアカウントでログインします。GitHub認証は書き込み可能なリポジトリ一覧と同期のため `repo` スコープを要求します。GitHub OAuth AppのDevice FlowはGitHub.comで有効にしてください。CopilotのDevice FlowはLiteLLMのGitHub Copilot連携を利用します。
+   登録後に表示されるClient IDが、このアプリ共通の公開識別子です。現在のClient IDはアプリに組み込み済みのため、通常は追加の設定は不要です。別のOAuth Appを使う場合だけ、サーバーの `GITHUB_OAUTH_CLIENT_ID` 環境変数で上書きしてください。Client secretはDevice Flowでは使わず、アプリに設定しないでください。このClient IDを使って各利用者が自分のGitHubアカウントでログインします。GitHub認証は書き込み可能なリポジトリ一覧と同期のため `repo` スコープを要求します。**OAuth Appの設定で「Enable Device Flow」を有効にして保存してください。** ログイン開始でHTTP 400になる場合はこの設定、Client ID、設定の保存を確認してください。CopilotのDevice FlowはLiteLLMのGitHub Copilot連携を利用します。
 4. アプリを起動します。
 
    ```bash
