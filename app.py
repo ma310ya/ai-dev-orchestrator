@@ -60,11 +60,9 @@ CANCEL_EVENT = threading.Event()
 STATE = {
     "running": False,
     "logs": [],
-    "spec": "",
     "result": None,
     "error": "",
     "form": {},
-    "last_request_text": "",
 }
 AUTH_LOCK = threading.Lock()
 AUTH_FLOWS = {
@@ -353,13 +351,8 @@ def start_workflow(form):
     with STATE_LOCK:
         if STATE["running"]:
             raise ValueError("別のパイプラインが実行中です。")
-        saved_spec = form.get("spec", "").strip()
-        if request_text != STATE["last_request_text"]:
-            saved_spec = ""
-        STATE["last_request_text"] = request_text
         STATE["running"] = True
         STATE["logs"] = []
-        STATE["spec"] = saved_spec
         STATE["result"] = None
         STATE["error"] = ""
         STATE["form"] = {
@@ -376,13 +369,13 @@ def start_workflow(form):
 
     worker = threading.Thread(
         target=run_workflow,
-        args=(worker_form, saved_spec),
+        args=(worker_form,),
         daemon=True,
     )
     worker.start()
 
 
-def run_workflow(form, saved_spec):
+def run_workflow(form):
     def log_status(message):
         with STATE_LOCK:
             STATE["logs"].append(str(message))
@@ -402,7 +395,7 @@ def run_workflow(form, saved_spec):
                 "code_model": form["code_model"],
                 "github_repo": form["github_repo"],
                 "github_branch": form["github_branch"],
-                "spec": saved_spec,
+                "spec": "",
                 "code": "",
                 "test_result": "",
                 "iteration": 0,
@@ -421,8 +414,6 @@ def run_workflow(form, saved_spec):
                 "test_result": result.get("test_result", ""),
                 "packages": extract_pip_packages(result.get("code", "")),
             }
-            if result.get("spec"):
-                STATE["spec"] = result["spec"]
     except Exception as error:
         with STATE_LOCK:
             STATE["error"] = str(error)
@@ -435,7 +426,6 @@ def run_workflow(form, saved_spec):
 def render_page(error=""):
     with STATE_LOCK:
         form = STATE["form"].copy()
-        spec = STATE["spec"]
     target_files = sorted(
         path.name
         for path in Path(".").glob("*.py")
@@ -529,15 +519,14 @@ def render_page(error=""):
     </label>
     <p id="model-hint" class="hint">GeminiモデルはGemini APIキーを登録すると選択肢に追加されます。</p>
     <label>要件・指示
-      <textarea name="request" placeholder="作成・修正したい内容や追加の指示を入力してください" required>{html.escape(form.get("request", ""))}</textarea>
+      <textarea name="request" placeholder="作成・修正したい内容や追加の指示を入力してください">{html.escape(form.get("request", ""))}</textarea>
     </label>
     <label>要件定義ファイル (.md / .txt)
-      <input type="file" name="spec_file" accept=".md,.txt,text/plain">
+      <input id="spec-file" type="file" name="spec_file" accept=".md,.txt,text/plain">
     </label>
-    <label>保存済み仕様書（編集可能）
-      <textarea id="spec" name="spec">{html.escape(spec)}</textarea>
+    <label>添付ファイルの内容（確認用・編集不可）
+      <textarea id="spec-preview" readonly placeholder="要件定義ファイルを選択すると、ここに内容が表示されます"></textarea>
     </label>
-    <p class="hint">仕様書生成AIが作成した内容を表示します。内容を編集して再実行すると、その仕様書を使ってコードを生成します（要件・添付ファイルを変更すると新しい仕様書を作成します）。</p>
     <div class="actions">
       <button id="run" class="run" type="submit">🚀 開発パイプラインを実行</button>
       <button id="cancel" class="cancel" type="button" onclick="cancelRun()">🛑 処理をキャンセル</button>
@@ -690,8 +679,6 @@ def render_page(error=""):
         document.getElementById('logs').textContent = data.logs.join('\\n') || '実行ログはここに表示されます。';
         document.getElementById('run').disabled = data.running;
         document.getElementById('cancel').disabled = !data.running;
-        const spec = document.getElementById('spec');
-        if (document.activeElement !== spec && data.spec) spec.value = data.spec;
         if (data.result || data.error) {{
           const panel = document.getElementById('result');
           panel.hidden = false;
@@ -709,6 +696,11 @@ def render_page(error=""):
       await fetch('/cancel', {{ method: 'POST' }});
       updateStatus();
     }}
+    document.getElementById('spec-file').addEventListener('change', async event => {{
+      const preview = document.getElementById('spec-preview');
+      const file = event.currentTarget.files[0];
+      preview.value = file ? await file.text() : '';
+    }});
     refreshAuthStatus();
     updateStatus();
     setInterval(refreshAuthStatus, 2000);
@@ -754,7 +746,6 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {
                     "running": STATE["running"],
                     "logs": STATE["logs"][:],
-                    "spec": STATE["spec"],
                     "result": STATE["result"],
                     "error": STATE["error"],
                 }
